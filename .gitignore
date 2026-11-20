@@ -1,0 +1,12 @@
+# Local secrets and environment
+.env
+.env.*
+!.env.example
+
+# Local runtime data and build artifacts
+data/
+/tmp/
+/dist/
+/build/
+*.exe
+*.test

@@ -1,0 +1,179 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: futurevoice-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+      DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+      APP_DIR: /opt/futurevoice
+
+    steps:
+      - name: Checkout the exact commit that passed CI
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_HOST:?Add DEPLOY_HOST to GitHub Actions secrets}"
+          : "${DEPLOY_USER:?Add DEPLOY_USER to GitHub Actions secrets}"
+          : "${DEPLOY_SSH_KEY:?Add DEPLOY_SSH_KEY to GitHub Actions secrets}"
+          : "${DEPLOY_KNOWN_HOSTS:?Add DEPLOY_KNOWN_HOSTS to GitHub Actions secrets}"
+
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Detect server architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${DEPLOY_PORT:-22}"
+          REMOTE_ARCH="$(ssh \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$PORT" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'uname -m')"
+
+          case "$REMOTE_ARCH" in
+            x86_64) GOARCH=amd64 ;;
+            aarch64|arm64) GOARCH=arm64 ;;
+            *) echo "Unsupported server architecture: $REMOTE_ARCH" >&2; exit 1 ;;
+          esac
+
+          echo "GOARCH=$GOARCH" >> "$GITHUB_ENV"
+          echo "Server architecture: $REMOTE_ARCH (GOARCH=$GOARCH)"
+
+      - name: Build Linux binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath -ldflags="-s -w" \
+            -o dist/futurevoice-server ./cmd/server
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath -ldflags="-s -w" \
+            -o dist/futurevoice-telegram ./telegram
+          tar -czf "$RUNNER_TEMP/futurevoice-${RELEASE_SHA}.tar.gz" -C dist .
+
+      - name: Upload release bundle to server
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${DEPLOY_PORT:-22}"
+          scp \
+            -i "$HOME/.ssh/id_ed25519" \
+            -P "$PORT" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$RUNNER_TEMP/futurevoice-${RELEASE_SHA}.tar.gz" \
+            "$DEPLOY_USER@$DEPLOY_HOST:/tmp/futurevoice-${RELEASE_SHA}.tar.gz"
+
+      - name: Deploy and rollback on failure
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${DEPLOY_PORT:-22}"
+
+          ssh \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$PORT" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "bash -s -- '$RELEASE_SHA' '$APP_DIR'" <<'REMOTE'
+          set -Eeuo pipefail
+
+          SHA="$1"
+          APP_DIR="$2"
+          RELEASES_DIR="$APP_DIR/releases"
+          CURRENT="$APP_DIR/current"
+          NEW_RELEASE="$RELEASES_DIR/$SHA"
+          ARCHIVE="/tmp/futurevoice-$SHA.tar.gz"
+          API_SERVICE="futurevoice-api.service"
+          BOT_SERVICE="futurevoice-bot.service"
+
+          test -f "$ARCHIVE"
+          mkdir -p "$RELEASES_DIR" "$NEW_RELEASE"
+          tar -xzf "$ARCHIVE" -C "$NEW_RELEASE"
+          rm -f "$ARCHIVE"
+          chmod +x "$NEW_RELEASE/futurevoice-server" "$NEW_RELEASE/futurevoice-telegram"
+
+          PREVIOUS=""
+          if [ -L "$CURRENT" ]; then
+            PREVIOUS="$(readlink -f "$CURRENT" || true)"
+          fi
+          if [ "$PREVIOUS" = "$NEW_RELEASE" ]; then
+            PREVIOUS=""
+          fi
+
+          rollback() {
+            echo "Deployment failed. Rolling back..." >&2
+            if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS" ]; then
+              ln -sfn "$PREVIOUS" "$APP_DIR/current.rollback"
+              mv -Tf "$APP_DIR/current.rollback" "$CURRENT"
+              sudo -n systemctl restart "$API_SERVICE" "$BOT_SERVICE" || true
+              echo "Restored previous release: $PREVIOUS" >&2
+            else
+              sudo -n systemctl stop "$API_SERVICE" "$BOT_SERVICE" || true
+              echo "No previous release exists; services were stopped." >&2
+            fi
+          }
+
+          ln -sfn "$NEW_RELEASE" "$APP_DIR/current.next"
+          mv -Tf "$APP_DIR/current.next" "$CURRENT"
+
+          if ! sudo -n systemctl restart "$API_SERVICE" "$BOT_SERVICE"; then
+            rollback
+            exit 1
+          fi
+
+          sleep 5
+          if ! sudo -n systemctl is-active --quiet "$API_SERVICE" || \
+             ! sudo -n systemctl is-active --quiet "$BOT_SERVICE"; then
+            rollback
+            exit 1
+          fi
+
+          echo "Deployment successful: $SHA"
+          REMOTE

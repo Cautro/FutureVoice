@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Verify, build and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Build Linux release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          for ARCH in amd64 arm64; do
+            BUILD_DIR="dist/linux-$ARCH"
+            mkdir -p "$BUILD_DIR"
+
+            CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -trimpath -ldflags="-s -w" \
+              -o "$BUILD_DIR/futurevoice-server" ./cmd/server
+            CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -trimpath -ldflags="-s -w" \
+              -o "$BUILD_DIR/futurevoice-telegram" ./telegram
+
+            tar -czf "dist/futurevoice-linux-$ARCH.tar.gz" -C "$BUILD_DIR" .
+          done
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz \
+            --title "FutureVoice $GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag

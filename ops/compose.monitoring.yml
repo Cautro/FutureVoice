@@ -1,0 +1,59 @@
+services:
+  metrics-auth:
+    image: busybox:1.37
+    container_name: futurevoice-metrics-auth-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        umask 077;
+        printf '%s' "$$METRICS_USER" > /auth/username;
+        printf '%s' "$$METRICS_PASSWORD" > /auth/password;
+        chmod 0444 /auth/username /auth/password
+    environment:
+      METRICS_USER: ${METRICS_USER:?Set METRICS_USER in .env}
+      METRICS_PASSWORD: ${METRICS_PASSWORD:?Set METRICS_PASSWORD in .env}
+    volumes:
+      - prometheus_auth:/auth
+
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    container_name: futurevoice-prometheus
+    depends_on:
+      metrics-auth:
+        condition: service_completed_successfully
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+      - prometheus_auth:/etc/prometheus/auth:ro
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.3.0
+    container_name: futurevoice-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  prometheus_auth:
+  grafana_data:
